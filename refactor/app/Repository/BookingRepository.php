@@ -4,6 +4,7 @@ namespace DTApi\Repository;
 
 use DTApi\Events\SessionEnded;
 use DTApi\Helpers\SendSMSHelper;
+use DTApi\Http\Services\NotificationService;
 use Event;
 use Carbon\Carbon;
 use Monolog\Logger;
@@ -102,21 +103,19 @@ class BookingRepository extends BaseRepository
      */
     public function getUsersJobsHistory($user_id, Request $request)
     {
-        $page = $request->get('page');
-        if (isset($page)) {
-            $pagenum = $page;
-        } else {
-            $pagenum = "1";
-        }
+        $pagenum = $request->get('page') ?? "1";
         $cuser = User::find($user_id);
+        if (!$cuser) {
+            return ['emergencyJobs' => [], 'normalJobs' => [], 'cuser' => null, 'usertype' => ''];
+        }
         $usertype = '';
         $emergencyJobs = array();
         $noramlJobs = array();
-        if ($cuser && $cuser->is('customer')) {
+        if ($cuser->is('customer')) {
             $jobs = $cuser->jobs()->with('user.userMeta', 'user.average', 'translatorJobRel.user.average', 'language', 'feedback', 'distance')->whereIn('status', ['completed', 'withdrawbefore24', 'withdrawafter24', 'timedout'])->orderBy('due', 'desc')->paginate(15);
             $usertype = 'customer';
             return ['emergencyJobs' => $emergencyJobs, 'noramlJobs' => [], 'jobs' => $jobs, 'cuser' => $cuser, 'usertype' => $usertype, 'numpages' => 0, 'pagenum' => 0];
-        } elseif ($cuser && $cuser->is('translator')) {
+        } elseif ($cuser->is('translator')) {
             $jobs_ids = Job::getTranslatorJobsHistoric($cuser->id, 'historic', $pagenum);
             $totaljobs = $jobs_ids->total();
             $numpages = ceil($totaljobs / 15);
@@ -146,7 +145,7 @@ class BookingRepository extends BaseRepository
 
             if (!isset($data['from_language_id'])) {
                 $response['status'] = 'fail';
-                $response['message'] = "Du måste fylla in alla fält";
+                $response['message'] = "Du måste fylla in alla fält"; // Must be from translations
                 $response['field_name'] = "from_language_id";
                 return $response;
             }
@@ -183,19 +182,8 @@ class BookingRepository extends BaseRepository
                     return $response;
                 }
             }
-            if (isset($data['customer_phone_type'])) {
-                $data['customer_phone_type'] = 'yes';
-            } else {
-                $data['customer_phone_type'] = 'no';
-            }
-
-            if (isset($data['customer_physical_type'])) {
-                $data['customer_physical_type'] = 'yes';
-                $response['customer_physical_type'] = 'yes';
-            } else {
-                $data['customer_physical_type'] = 'no';
-                $response['customer_physical_type'] = 'no';
-            }
+            $data['customer_phone_type'] = $data['customer_phone_type'] ?? 'no';
+            $data['customer_physical_type'] = $response['customer_physical_type'] = isset($data['customer_physical_type']) ? 'yes' : 'no';
 
             if ($data['immediate'] == 'yes') {
                 $due_carbon = Carbon::now()->addMinute($immediatetime);
@@ -215,32 +203,18 @@ class BookingRepository extends BaseRepository
                     return $response;
                 }
             }
-            if (in_array('male', $data['job_for'])) {
-                $data['gender'] = 'male';
-            } else if (in_array('female', $data['job_for'])) {
-                $data['gender'] = 'female';
-            }
-            if (in_array('normal', $data['job_for'])) {
-                $data['certified'] = 'normal';
-            }
-            else if (in_array('certified', $data['job_for'])) {
-                $data['certified'] = 'yes';
-            } else if (in_array('certified_in_law', $data['job_for'])) {
-                $data['certified'] = 'law';
-            } else if (in_array('certified_in_helth', $data['job_for'])) {
-                $data['certified'] = 'health';
-            }
-            if (in_array('normal', $data['job_for']) && in_array('certified', $data['job_for'])) {
-                $data['certified'] = 'both';
-            }
-            else if(in_array('normal', $data['job_for']) && in_array('certified_in_law', $data['job_for']))
-            {
-                $data['certified'] = 'n_law';
-            }
-            else if(in_array('normal', $data['job_for']) && in_array('certified_in_helth', $data['job_for']))
-            {
-                $data['certified'] = 'n_health';
-            }
+            $data['gender'] = in_array('male', $data['job_for']) ? 'male' : (in_array('female', $data['job_for']) ? 'female' : null);
+            $data['certified'] = match (true) {
+                in_array('normal', $data['job_for']) && in_array('certified', $data['job_for']) => 'both',
+                in_array('normal', $data['job_for']) && in_array('certified_in_law', $data['job_for']) => 'n_law',
+                in_array('normal', $data['job_for']) && in_array('certified_in_helth', $data['job_for']) => 'n_health',
+                in_array('normal', $data['job_for']) => 'normal',
+                in_array('certified', $data['job_for']) => 'yes',
+                in_array('certified_in_law', $data['job_for']) => 'law',
+                in_array('certified_in_helth', $data['job_for']) => 'health',
+                default => null,
+            };
+
             if ($consumer_type == 'rwsconsumer')
                 $data['job_type'] = 'rws';
             else if ($consumer_type == 'ngo')
@@ -315,7 +289,7 @@ class BookingRepository extends BaseRepository
             $email = $user->email;
             $name = $user->name;
         }
-        $subject = 'Vi har mottagit er tolkbokning. Bokningsnr: #' . $job->id;
+        $subject = 'Vi har mottagit er tolkbokning. Bokningsnr: #' . $job->id; // Translation missing
         $send_data = [
             'user' => $user,
             'job'  => $job
@@ -470,15 +444,14 @@ class BookingRepository extends BaseRepository
         $gender = $user_meta->gender;
         $translator_level = $user_meta->translator_level;
         $job_ids = Job::getJobs($user_id, $job_type, 'pending', $userlanguage, $gender, $translator_level);
-        foreach ($job_ids as $k => $v)     // checking translator town
-        {
-            $job = Job::find($v->id);
-            $jobuserid = $job->user_id;
-            $checktown = Job::checkTowns($jobuserid, $user_id);
-            if (($job->customer_phone_type == 'no' || $job->customer_phone_type == '') && $job->customer_physical_type == 'yes' && $checktown == false) {
-                unset($job_ids[$k]);
-            }
-        }
+        $jobIds = $job_ids->pluck('id');
+        $jobs = Job::whereIn('id', $jobIds)->get(); // Optimized DB calls
+        $job_ids = $jobs->filter(function ($job) use ($user_id) {
+            $checktown = Job::checkTowns($job->user_id, $user_id);
+            return !(($job->customer_phone_type === 'no' || empty($job->customer_phone_type)) &&
+                $job->customer_physical_type === 'yes' &&
+                !$checktown);
+        })->pluck('id');
         $jobs = TeHelper::convertJobIdsInObjs($job_ids);
         return $jobs;
     }
@@ -530,6 +503,9 @@ class BookingRepository extends BaseRepository
             "en" => $msg_contents
         );
 
+        /*
+         * Same Logger Instruction i Added above in __construct
+         * */
         $logger = new Logger('push_logger');
 
         $logger->pushHandler(new StreamHandler(storage_path('logs/push/laravel-' . date('Y-m-d') . '.log'), Logger::DEBUG));
@@ -561,17 +537,11 @@ class BookingRepository extends BaseRepository
         $physicalJobMessageTemplate = trans('sms.physical_job', ['date' => $date, 'time' => $time, 'town' => $city, 'duration' => $duration, 'jobId' => $jobId]);
 
         // analyse weather it's phone or physical; if both = default to phone
-        if ($job->customer_physical_type == 'yes' && $job->customer_phone_type == 'no') {
-            // It's a physical job
+        if ($job->customer_physical_type === 'yes' && $job->customer_phone_type === 'no') {
             $message = $physicalJobMessageTemplate;
-        } else if ($job->customer_physical_type == 'no' && $job->customer_phone_type == 'yes') {
-            // It's a phone job
-            $message = $phoneJobMessageTemplate;
-        } else if ($job->customer_physical_type == 'yes' && $job->customer_phone_type == 'yes') {
-            // It's both, but should be handled as phone job
+        } elseif ($job->customer_phone_type === 'yes') {
             $message = $phoneJobMessageTemplate;
         } else {
-            // This shouldn't be feasible, so no handling of this edge case
             $message = '';
         }
         Log::info($message);
@@ -627,12 +597,14 @@ class BookingRepository extends BaseRepository
         $logger->pushHandler(new StreamHandler(storage_path('logs/push/laravel-' . date('Y-m-d') . '.log'), Logger::DEBUG));
         $logger->pushHandler(new FirePHPHandler());
         $logger->addInfo('Push send for job ' . $job_id, [$users, $data, $msg_text, $is_need_delay]);
+        /*
+         * Multiple Environment Variables shouldn't be used, it should be single for DEV only DevID and for PROD only PRODID, this is not a good practice
+         * also it requires additional checks
+         * */
         if (env('APP_ENV') == 'prod') {
             $onesignalAppID = config('app.prodOnesignalAppID');
-            $onesignalRestAuthKey = sprintf("Authorization: Basic %s", config('app.prodOnesignalApiKey'));
         } else {
             $onesignalAppID = config('app.devOnesignalAppID');
-            $onesignalRestAuthKey = sprintf("Authorization: Basic %s", config('app.devOnesignalApiKey'));
         }
 
         $user_tags = $this->getUserTagsStringFromArray($users);
@@ -667,17 +639,8 @@ class BookingRepository extends BaseRepository
             $fields['send_after'] = $next_business_time;
         }
         $fields = json_encode($fields);
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, "https://onesignal.com/api/v1/notifications");
-        curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: application/json', $onesignalRestAuthKey));
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
-        curl_setopt($ch, CURLOPT_HEADER, FALSE);
-        curl_setopt($ch, CURLOPT_POST, TRUE);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $fields);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, FALSE);
-        $response = curl_exec($ch);
-        $logger->addInfo('Push send for job ' . $job_id . ' curl answer', [$response]);
-        curl_close($ch);
+
+        (new NotificationService())->sendNotification($fields , $job_id , $logger);
     }
 
     /**
@@ -910,7 +873,7 @@ class BookingRepository extends BaseRepository
         $job->save();
         return true;
 //        }
-        return false;
+        //return false; // why this return, this line of code never executes
     }
 
     /**
@@ -965,7 +928,7 @@ class BookingRepository extends BaseRepository
         $job->save();
         return true;
 //        }
-        return false;
+        //return false; // why this return, this line of code never executes
     }
 
     /**
@@ -1170,7 +1133,7 @@ class BookingRepository extends BaseRepository
             return ['dateChanged' => $dateChanged, 'log_data' => $log_data];
         }
 
-        return ['dateChanged' => $dateChanged];
+        return ['dateChanged' => $dateChanged]; // the response should be uniform, checks can be applied on property
 
     }
 
@@ -1914,8 +1877,10 @@ class BookingRepository extends BaseRepository
 
         $languages = Language::where('active', '1')->orderBy('language')->get();
         $requestdata = Request::all();
-        $all_customers = DB::table('users')->where('user_type', '1')->lists('email');
-        $all_translators = DB::table('users')->where('user_type', '2')->lists('email');
+        $allUsers = User::whereIn('user_type', ['1', '2'])->pluck('email', 'user_type');
+        $all_customers = $allUsers->filter(fn($email, $userType) => $userType === '1')->values();
+        $all_translators = $allUsers->filter(fn($email, $userType) => $userType === '2')->values();
+
 
         $cuser = Auth::user();
         $consumer_type = TeHelper::getUsermeta($cuser->id, 'consumer_type');
