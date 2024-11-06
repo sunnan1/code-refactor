@@ -44,11 +44,19 @@ class BookingRepository extends BaseRepository
     function __construct(Job $model, MailerInterface $mailer)
     {
         parent::__construct($model);
+        /*
+         * This whole code can be refactored
+         * Define custom logging channel in logging.php
+         * Define a 'tap' property in that channel and define the CustomLogger class
+         * No need of StreamHandler as 'daily' uses StreamHandler under the hood
+         * Pass FirePHPHandler in pushHandler in that new Class
+         * Finally $this->logger = Log::channel('admin_logger'); in
+         * */
         $this->mailer = $mailer;
         $this->logger = new Logger('admin_logger');
 
-        $this->logger->pushHandler(new StreamHandler(storage_path('logs/admin/laravel-' . date('Y-m-d') . '.log'), Logger::DEBUG));
-        $this->logger->pushHandler(new FirePHPHandler());
+        $this->logger->pushHandler(new StreamHandler(storage_path('logs/admin/laravel-' . date('Y-m-d') . '.log'), Logger::DEBUG)); // By Following above instructions no need of this code
+        $this->logger->pushHandler(new FirePHPHandler()); // By Following above instructions no need of this code
     }
 
     /**
@@ -58,28 +66,31 @@ class BookingRepository extends BaseRepository
     public function getUsersJobs($user_id)
     {
         $cuser = User::find($user_id);
+        if (!$cuser) {
+            return ['emergencyJobs' => [], 'normalJobs' => [], 'cuser' => null, 'usertype' => ''];
+        }
         $usertype = '';
         $emergencyJobs = array();
         $noramlJobs = array();
-        if ($cuser && $cuser->is('customer')) {
+        $jobs = null;
+        if ($cuser->is('customer')) {
             $jobs = $cuser->jobs()->with('user.userMeta', 'user.average', 'translatorJobRel.user.average', 'language', 'feedback')->whereIn('status', ['pending', 'assigned', 'started'])->orderBy('due', 'asc')->get();
             $usertype = 'customer';
-        } elseif ($cuser && $cuser->is('translator')) {
-            $jobs = Job::getTranslatorJobs($cuser->id, 'new');
-            $jobs = $jobs->pluck('jobs')->all();
+        } elseif ($cuser->is('translator')) {
+            $jobs = Job::getTranslatorJobs($cuser->id, 'new')->pluck('jobs')->flatten();
+            //$jobs = $jobs->pluck('jobs')->all();
             $usertype = 'translator';
         }
         if ($jobs) {
-            foreach ($jobs as $jobitem) {
-                if ($jobitem->immediate == 'yes') {
-                    $emergencyJobs[] = $jobitem;
+            $jobs->each(function ($job) use (&$emergencyJobs, &$normalJobs, $userId) {
+                if ($job->immediate === 'yes') {
+                    $emergencyJobs->push($job);
                 } else {
-                    $noramlJobs[] = $jobitem;
+                    $job['usercheck'] = Job::checkParticularJob($userId, $job);
+                    $normalJobs->push($job);
                 }
-            }
-            $noramlJobs = collect($noramlJobs)->each(function ($item, $key) use ($user_id) {
-                $item['usercheck'] = Job::checkParticularJob($user_id, $item);
-            })->sortBy('due')->all();
+            });
+            $normalJobs = $normalJobs->sortBy('due')->values();
         }
 
         return ['emergencyJobs' => $emergencyJobs, 'noramlJobs' => $noramlJobs, 'cuser' => $cuser, 'usertype' => $usertype];
